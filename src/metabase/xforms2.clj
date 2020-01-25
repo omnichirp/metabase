@@ -1,5 +1,6 @@
 (ns metabase.xforms2
-  (:require [metabase
+  (:require [clojure.core.async :as a]
+            [metabase
              [driver :as driver]
              [test :as mt]
              [util :as u]]
@@ -92,15 +93,15 @@
         (reducible-result-set driver rs rf init)))))
 
 (defn- reducible-result-set [driver ^ResultSet rs rf init]
-  (let [rsmeta   (.getMetaData rs)
-        col-meta (rf init (col-meta rsmeta))
-        read-row (read-row-fn driver rs rsmeta)]
+  (let [rsmeta       (.getMetaData rs)
+        results-meta (rf init {:cols (col-meta rsmeta)})
+        read-row     (read-row-fn driver rs rsmeta)]
     (println "<Consuming results>")
     (loop [result init]
       (if-not (.next rs)
         result
         (let [row    (read-row)
-              result (rf result col-meta row)]
+              result (rf result results-meta row)]
           (if (reduced? result)
             @result
             (recur result)))))))
@@ -110,8 +111,8 @@
 
   ([row-count] {:rows row-count})
 
-  ([row-count col-meta]
-   (println "COLS ->" (pr-str col-meta))
+  ([row-count results-meta]
+   (println "results meta ->\n" (u/pprint-to-str 'blue results-meta))
    row-count)
 
   ([row-count _ row]
@@ -124,15 +125,15 @@
 
     ([row-count] {:rows row-count})
 
-    ([_ col-meta]
-     (.write writer (str "COLS -> " (pr-str (map :name col-meta)) "\n"))
-     col-meta)
+    ([_ results-meta]
+     (.write writer (str "results meta -> " (pr-str results-meta) "\n"))
+     results-meta)
 
     ([row-count _ row]
      (.write writer (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
      (inc row-count))))
 
-(defn- rows-xform [rf]
+(defn- add-a-column-xform [rf]
   (fn
     ([]
      (rf))
@@ -141,61 +142,97 @@
      (rf result))
 
     ([result results-meta]
-     (rf result (conj (vec results-meta) {:name :extra-col})))
+     (rf result (update results-meta :cols (fn [cols]
+                                             (conj (vec cols) {:name :extra-col})))))
 
     ([acc results-meta row]
      (rf acc results-meta (conj row "Neat!")))))
 
-#_(defn process-query [driver query rf]
-  (transduce
-   (comp rows-xform rows-xform)
-   rf
-   (reducible-results driver query)))
-
-
-(defn middleware-1 [qp]
-  (fn [query respond raise xform rf canceled-chan]
-    (println "<IN MIDDLEWARE 1>")
-    (qp query respond raise xform rf canceled-chan)))
-
 (defn- middleware-1 [qp]
-  (fn [query xform rf]
+  (fn [query results-xform chans]
     (println "IN MIDDLEWARE 1!")
-    (qp query xform rf)))
+    (qp query results-xform chans)))
 
-(defn- middleware-2 [qp]
-  (fn [query xform rf]
-    (qp query (comp xform rows-xform) rf)))
+(defn- add-a-column-middleware [qp]
+  (fn [query results-xform chans]
+    (qp query (comp results-xform add-a-column-xform) chans)))
 
-(defn- pipeline [f]
+(defn- async-middleware [qp]
+  (fn [query results-xform {:keys [cancel-chan], :as chans}]
+    (let [futur (future
+                  (println "Sleep 500.")
+                  (Thread/sleep 500)
+                  (println "Done sleeping.")
+                  (qp query results-xform chans))]
+      (a/go
+        (when (a/<! (:cancel-chan chans))
+          (future-cancel futur))))
+    nil))
+
+(defn- build-pipeline [f]
   (-> f
       middleware-1
-      middleware-2))
+      async-middleware
+      add-a-column-middleware))
 
-(defn process-query [driver query rf]
-  ((pipeline
-     (fn [query xform rf]
-       (transduce xform rf (reducible-results driver query))))
-   query
-   identity
-   rf))
+(def ^{:arglists '([query results-xform chans])} pipeline
+  (build-pipeline
+   (fn [query results-xform {:keys [cancel-chan out-chan rf]}]
+     (try
+       (let [result (transduce results-xform rf (reducible-results :postgres query))]
+         (a/put! out-chan (or result :no-result)))
+       (catch Throwable e
+         (a/put! out-chan e))
+       (finally
+         (a/close! cancel-chan)
+         (a/close! out-chan))))))
+
+(defn process-query-async [query rf]
+  (println "Starting query.")
+  (let [out-chan    (a/promise-chan)
+        cancel-chan (a/promise-chan)
+        chans       {:out-chan out-chan, :cancel-chan (a/promise-chan)}
+        ;; TODO - should use a bounded threadpool for this
+        futur       (future (pipeline query identity (assoc chans :rf rf)))]
+    (a/go
+      (when (a/<! (:cancel-chan chans))
+        (println "Query canceled.")
+        (future-cancel futur)
+        (a/put! out-chan {:status :canceled})
+        (a/close! out-chan)
+        (a/close! cancel-chan)))
+    chans))
+
+(defn process-query [query rf]
+  ;; TODO - timeout?
+  (let [{:keys [out-chan]} (process-query-async query rf)
+        result             (a/<!! out-chan)]
+    (println "<< QUERY FINISHED >>")
+    (when (instance? Throwable result)
+      (throw result))
+    result))
 
 
 ;;; ------------------------------------------------------ test ------------------------------------------------------
 
 (defn- x []
-  (process-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" print-rows-rf))
+  (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" print-rows-rf))
 
 (defn- x2 []
   (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test.txt")]
-    (process-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" (print-rows-to-writer-rf w))))
+    (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" (print-rows-to-writer-rf w))))
 
 (defn- maps-rf
   ([] [])
   ([acc] acc)
   ([_ results-meta] results-meta)
-  ([acc col-meta row] (conj acc (zipmap (map (comp keyword :name) col-meta)
-                                        row))))
+  ([acc results-meta row] (conj acc (zipmap (map (comp keyword :name) (:cols results-meta))
+                                            row))))
 
 (defn- y []
-  (process-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))
+  (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))
+
+(defn- z []
+  (let [{:keys [cancel-chan out-chan]} (process-query-async "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf)]
+    (a/put! cancel-chan :cancel)
+    (a/<!! out-chan)))
