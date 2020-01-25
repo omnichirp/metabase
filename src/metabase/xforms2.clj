@@ -69,7 +69,7 @@
 
 (declare reducible-result-set)
 
-(defn- reducible-query
+(defn- reducible-results
   [driver ^String sql]
   (reify
     clojure.lang.IReduce
@@ -93,10 +93,10 @@
 
 (defn- reducible-result-set [driver ^ResultSet rs rf init]
   (let [rsmeta   (.getMetaData rs)
-        col-meta (col-meta rsmeta)
+        col-meta (rf init (col-meta rsmeta))
         read-row (read-row-fn driver rs rsmeta)]
     (println "<Consuming results>")
-    (loop [result (rf init col-meta)]
+    (loop [result init]
       (if-not (.next rs)
         result
         (let [row    (read-row)
@@ -124,9 +124,9 @@
 
     ([row-count] {:rows row-count})
 
-    ([row-count col-meta]
+    ([_ col-meta]
      (.write writer (str "COLS -> " (pr-str (map :name col-meta)) "\n"))
-     row-count)
+     col-meta)
 
     ([row-count _ row]
      (.write writer (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
@@ -141,28 +141,61 @@
      (rf result))
 
     ([result results-meta]
-     (rf result (for [m results-meta]
-                  (assoc m :wow? true))))
+     (rf result (conj (vec results-meta) {:name :extra-col})))
 
     ([acc results-meta row]
-     (rf acc results-meta (mapv #(if (string? %)
-                                   (clojure.string/upper-case %)
-                                   %)
-                                row)))))
+     (rf acc results-meta (conj row "Neat!")))))
 
-(defn- x []
+#_(defn process-query [driver query rf]
   (transduce
    (comp rows-xform rows-xform)
-   print-rows-rf
-   (reducible-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;")))
+   rf
+   (reducible-results driver query)))
+
+
+(defn middleware-1 [qp]
+  (fn [query respond raise xform rf canceled-chan]
+    (println "<IN MIDDLEWARE 1>")
+    (qp query respond raise xform rf canceled-chan)))
+
+(defn- middleware-1 [qp]
+  (fn [query xform rf]
+    (println "IN MIDDLEWARE 1!")
+    (qp query xform rf)))
+
+(defn- middleware-2 [qp]
+  (fn [query xform rf]
+    (qp query (comp xform rows-xform) rf)))
+
+(defn- pipeline [f]
+  (-> f
+      middleware-1
+      middleware-2))
+
+(defn process-query [driver query rf]
+  ((pipeline
+     (fn [query xform rf]
+       (transduce xform rf (reducible-results driver query))))
+   query
+   identity
+   rf))
+
+
+;;; ------------------------------------------------------ test ------------------------------------------------------
+
+(defn- x []
+  (process-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" print-rows-rf))
 
 (defn- x2 []
   (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test.txt")]
-    (transduce
-     (comp rows-xform rows-xform)
-     (print-rows-to-writer-rf w)
-     (reducible-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;"))))
+    (process-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" (print-rows-to-writer-rf w))))
 
-#_(defn- middleware [qp]
-    (fn [query respond rows-xform raise canceled-chan]
-      (qp query respond rows-xform raise canceled-chan)))
+(defn- maps-rf
+  ([] [])
+  ([acc] acc)
+  ([_ results-meta] results-meta)
+  ([acc col-meta row] (conj acc (zipmap (map (comp keyword :name) col-meta)
+                                        row))))
+
+(defn- y []
+  (process-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))
