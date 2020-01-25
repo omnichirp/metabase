@@ -131,8 +131,8 @@
 (defn- async-middleware [qp]
   (fn [query results-xform {:keys [cancel-chan], :as chans}]
     (let [futur (future
-                  (println "Sleep 500.")
-                  (Thread/sleep 500)
+                  (println "Sleep 50.")
+                  (Thread/sleep 50)
                   (println "Done sleeping.")
                   (qp query results-xform chans))]
       (a/go
@@ -140,48 +140,49 @@
           (future-cancel futur))))
     nil))
 
-(defn- process* [result-fn]
-  (fn [query results-xform {:keys [cancel-chan out-chan], :as chans}]
-    (try
-      (let [result (result-fn query results-xform chans)]
-        (a/put! out-chan (or result :no-result))
-        result)
-      (catch Throwable e
-        (a/put! out-chan e))
-      (finally
-        (a/close! cancel-chan)
-        (a/close! out-chan)))))
+(defn- async-cancel-middleware [qp]
+  (fn [query results-xform {:keys [out-chan cancel-chan], :as chans}]
+    ;; TODO - should use a bounded threadpool for this
+    (let [futur (future (qp query results-xform chans))]
+      (a/go
+        (when (a/<! (:cancel-chan chans))
+          (println "Query canceled.")
+          (future-cancel futur)
+          (a/put! out-chan {:status :canceled})
+          (a/close! out-chan)
+          (a/close! cancel-chan)))
+      nil)))
 
-(defn- build-pipeline [result-fn]
-  (-> (process* result-fn)
-      middleware-1
-      async-middleware
-      add-a-column-middleware))
+(def default-middleware
+  [middleware-1
+   async-middleware
+   add-a-column-middleware
+   async-cancel-middleware])
 
-(defn query-processor [results-xform result-fn]
-  (let [pipeline (build-pipeline result-fn)]
-    (fn [query]
-      (println "Starting query.")
-      (let [out-chan    (a/promise-chan)
-            cancel-chan (a/promise-chan)
-            chans       {:out-chan out-chan, :cancel-chan (a/promise-chan)}
-            ;; TODO - should use a bounded threadpool for this
-            ;; Or should this be handled by middleware?
-            futur       (future (pipeline query results-xform chans))]
-        (a/go
-          (when (a/<! (:cancel-chan chans))
-            (println "Query canceled.")
-            (future-cancel futur)
-            (a/put! out-chan {:status :canceled})
-            (a/close! out-chan)
-            (a/close! cancel-chan)))
-        chans))))
+(defn- execute* [rf]
+  (fn [query xform _]
+    (execute-query-2 :postgres query xform rf)))
 
-(defn async-transducing-qp [results-xform rf]
-  (query-processor
-   results-xform
-   (fn [query xform _]
-     (execute-query-2 :postgres query xform rf))))
+(defn process* [rf]
+  (let [execute** (execute* rf)]
+    (fn
+      [query results-xform {:keys [cancel-chan out-chan], :as chans}]
+      (try
+        (let [result (execute** query results-xform chans)]
+          (a/put! out-chan (or result :no-result))
+          result)
+        (catch Throwable e
+          (a/put! out-chan e))
+        (finally
+          (a/close! cancel-chan)
+          (a/close! out-chan))))))
+
+(defn- build-pipeline [rf middleware]
+  (reduce
+   (fn [f middleware]
+     (middleware f))
+   (process* rf)
+   middleware))
 
 (defn default-rf
   ([] {:data {:rows []}})
@@ -194,18 +195,38 @@
   ([results _ row]
    (update-in results [:data :rows] conj row)))
 
-(def ^:private default-async-transducing-qp
-  (async-transducing-qp identity default-rf))
+(defn build-query-processor
+  ([]
+   (build-query-processor default-rf))
+
+  ([rf]
+   (build-query-processor identity rf))
+
+  ([results-xform rf]
+   (build-query-processor results-xform rf default-middleware))
+
+  ([results-xform rf middleware]
+   (let [pipeline (build-pipeline rf middleware)]
+     (fn [query]
+       (println "Starting query.")
+       (let [chans {:out-chan (a/promise-chan), :cancel-chan (a/promise-chan)}]
+         (pipeline query results-xform chans)
+         chans)))))
+
+(def ^:private default-query-processor (build-query-processor))
 
 (defn process-query-async
   ([query]
-   (default-async-transducing-qp query))
+   (default-query-processor query))
 
   ([query rf]
-   ((async-transducing-qp identity rf) query))
+   ((build-query-processor rf) query))
 
   ([query results-xform rf]
-   ((async-transducing-qp results-xform rf) query)))
+   ((build-query-processor results-xform rf) query))
+
+  ([query results-xform rf middleware]
+   ((build-query-processor results-xform rf middleware) query)))
 
 (defn sync-results [{:keys [out-chan]}]
   ;; TODO - timeout?
@@ -223,7 +244,50 @@
    (sync-results (process-query-async query rf)))
 
   ([query results-xform rf]
-   (sync-results (process-query-async query results-xform rf))))
+   (sync-results (process-query-async query results-xform rf)))
+
+  ([query results-xform rf middleware]
+   (sync-results (process-query-async query results-xform rf middleware))))
+
+;; TODO - or should this be some sort of middleware? For async situations
+(defn userland-exception-middleware [qp]
+  (fn [query results-xform {:keys [out-chan], :as chans}]
+    (letfn [(exception-response [^Throwable e]
+              (merge
+               {:message    (.getMessage e)
+                :stacktrace (u/filtered-stacktrace e)}
+               (when-let [cause (.getCause e)]
+                 {:cause (exception-response cause)})))]
+      (let [new-out-chan (a/promise-chan)]
+        ;; close `new-out-chan` if `out-chan` gets closed
+        (a/go
+          (a/<! out-chan)
+          (a/close! new-out-chan))
+        (a/go
+          (when-let [result (a/<! new-out-chan)]
+            (println "result:" result)  ; NOCOMMIT
+            (if (instance? Throwable result)
+              (a/>! out-chan (exception-response result))
+              (a/>! out-chan result))
+            (a/close! new-out-chan)
+            (a/close! out-chan)))
+        (qp query results-xform (assoc chans :out-chan new-out-chan))))))
+
+#_(defn process-userland-query [query]
+  (letfn [(exception-response [^Throwable e]
+            (merge
+             {:message    (.getMessage e)
+              :stacktrace (u/filtered-stacktrace e)}
+             (when-let [cause (.getCause e)]
+               {:cause (exception-response cause)})))]
+    (try
+      (process-query query)
+      (catch Throwable e
+        (assoc (exception-response e)
+               :status :failed)))))
+
+(defn process-userland-query [query]
+  (process-query query identity default-rf (cons userland-exception-middleware default-middleware)))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -249,9 +313,9 @@
 
     ([row-count] {:rows row-count})
 
-    ([_ results-meta]
+    ([row-count results-meta]
      (.write writer (str "results meta -> " (pr-str results-meta) "\n"))
-     results-meta)
+     row-count)
 
     ([row-count _ row]
      (.write writer (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
@@ -283,3 +347,9 @@
   (let [{:keys [cancel-chan out-chan]} (process-query-async "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf)]
     (a/put! cancel-chan :cancel)
     (a/<!! out-chan)))
+
+(defn- exception-example []
+  (process-query "SELECT asdasdasd;"))
+
+(defn- userland-exception-example []
+  (process-userland-query "SELECT asdasdasd;"))
