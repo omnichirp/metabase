@@ -70,43 +70,37 @@
       :db_type   (.getColumnTypeName rsmeta i)})
    (range 1 (inc (.getColumnCount rsmeta)))))
 
-(declare reducible-result-set)
-
-(defn- reducible-results
-  [driver ^String sql]
-  (reify
-    clojure.lang.IReduce
-    (reduce [this rf]
-      (.reduce ^clojure.lang.IReduceInit this rf (rf)))
-
-    clojure.lang.IReduceInit
-    (reduce [_ rf init]
-      (println "<Running query>")
-      (with-open [conn (doto (.getConnection (datasource))
-                         (.setAutoCommit false)
-                         (.setReadOnly true)
-                         (.setTransactionIsolation Connection/TRANSACTION_READ_UNCOMMITTED))
-                  stmt (doto (.prepareStatement conn sql
-                                                ResultSet/TYPE_FORWARD_ONLY
-                                                ResultSet/CONCUR_READ_ONLY
-                                                ResultSet/CLOSE_CURSORS_AT_COMMIT)
-                         (.setFetchDirection ResultSet/FETCH_FORWARD))
-                  rs   (.executeQuery stmt)]
-        (reducible-result-set driver rs rf init)))))
-
-(defn- reducible-result-set [driver ^ResultSet rs rf init]
-  (let [rsmeta       (.getMetaData rs)
-        read-row     (read-row-fn driver rs rsmeta)
-        results-meta (col-meta rsmeta)]
-    (println "<Consuming results>")
-    (loop [result (rf init {:cols results-meta})]
-      (if-not (.next rs)
-        result
-        (let [row    (read-row)
-              result (rf result results-meta row)]
-          (if (reduced? result)
-            @result
-            (recur result)))))))
+(defn- execute-query-2
+  [driver ^String sql xform rf]
+  (println "<Running query>")
+  (with-open [conn (doto (.getConnection (datasource))
+                     (.setAutoCommit false)
+                     (.setReadOnly true)
+                     (.setTransactionIsolation Connection/TRANSACTION_READ_UNCOMMITTED))
+              stmt (doto (.prepareStatement conn sql
+                                            ResultSet/TYPE_FORWARD_ONLY
+                                            ResultSet/CONCUR_READ_ONLY
+                                            ResultSet/CLOSE_CURSORS_AT_COMMIT)
+                     (.setFetchDirection ResultSet/FETCH_FORWARD))
+              rs   (.executeQuery stmt)]
+    (let [rsmeta       (.getMetaData rs)
+          read-row     (read-row-fn driver rs rsmeta)
+          results-meta {:cols (col-meta rsmeta)}]
+      (println "<Consuming results>")
+      (transduce
+       xform
+       rf
+       (reify
+         clojure.lang.IReduceInit
+         (reduce [_ rf init]
+           (loop [result (rf init results-meta)]
+             (if-not (.next rs)
+               result
+               (let [row    (read-row)
+                     result (rf result results-meta row)]
+                 (if (reduced? result)
+                   @result
+                   (recur result)))))))))))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -187,7 +181,7 @@
   (query-processor
    results-xform
    (fn [query xform _]
-     (transduce xform rf (reducible-results :postgres query)))))
+     (execute-query-2 :postgres query xform rf))))
 
 (defn default-rf
   ([] {:data {:rows []}})
