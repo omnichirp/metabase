@@ -8,7 +8,9 @@
   (:import [java.sql Connection JDBCType ResultSet ResultSetMetaData Types]
            javax.sql.DataSource))
 
-;; New QP style
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                JDBC Execute 2.0                                                |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defn- jdbc-spec []
   (sql-jdbc.conn/db->pooled-connection-spec (mt/with-driver :postgres (mt/db))))
@@ -94,10 +96,10 @@
 
 (defn- reducible-result-set [driver ^ResultSet rs rf init]
   (let [rsmeta       (.getMetaData rs)
-        results-meta (rf init {:cols (col-meta rsmeta)})
-        read-row     (read-row-fn driver rs rsmeta)]
+        read-row     (read-row-fn driver rs rsmeta)
+        results-meta (col-meta rsmeta)]
     (println "<Consuming results>")
-    (loop [result init]
+    (loop [result (rf init {:cols results-meta})]
       (if-not (.next rs)
         result
         (let [row    (read-row)
@@ -105,6 +107,134 @@
           (if (reduced? result)
             @result
             (recur result)))))))
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                              Sample Middleware/QP                                              |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn- middleware-1 [qp]
+  (fn [query results-xform chans]
+    (println "IN MIDDLEWARE 1!")
+    (qp query results-xform chans)))
+
+(defn- add-a-column-xform [rf]
+  (fn
+    ([result]
+     (rf result))
+
+    ([result results-meta]
+     (rf result (update results-meta :cols (fn [cols]
+                                             (conj (vec cols) {:name (format "extra-col-%d" (inc (count (:cols results-meta))))})))))
+
+    ([acc results-meta row]
+     (rf acc results-meta (conj row "Neat!")))))
+
+(defn- add-a-column-middleware [qp]
+  (fn [query results-xform chans]
+    (qp query (comp results-xform add-a-column-xform add-a-column-xform) chans)))
+
+(defn- async-middleware [qp]
+  (fn [query results-xform {:keys [cancel-chan], :as chans}]
+    (let [futur (future
+                  (println "Sleep 500.")
+                  (Thread/sleep 500)
+                  (println "Done sleeping.")
+                  (qp query results-xform chans))]
+      (a/go
+        (when (a/<! (:cancel-chan chans))
+          (future-cancel futur))))
+    nil))
+
+(defn- process* [result-fn]
+  (fn [query results-xform {:keys [cancel-chan out-chan], :as chans}]
+    (try
+      (let [result (result-fn query results-xform chans)]
+        (a/put! out-chan (or result :no-result))
+        result)
+      (catch Throwable e
+        (a/put! out-chan e))
+      (finally
+        (a/close! cancel-chan)
+        (a/close! out-chan)))))
+
+(defn- build-pipeline [result-fn]
+  (-> (process* result-fn)
+      middleware-1
+      async-middleware
+      add-a-column-middleware))
+
+(defn query-processor [results-xform result-fn]
+  (let [pipeline (build-pipeline result-fn)]
+    (fn [query]
+      (println "Starting query.")
+      (let [out-chan    (a/promise-chan)
+            cancel-chan (a/promise-chan)
+            chans       {:out-chan out-chan, :cancel-chan (a/promise-chan)}
+            ;; TODO - should use a bounded threadpool for this
+            ;; Or should this be handled by middleware?
+            futur       (future (pipeline query results-xform chans))]
+        (a/go
+          (when (a/<! (:cancel-chan chans))
+            (println "Query canceled.")
+            (future-cancel futur)
+            (a/put! out-chan {:status :canceled})
+            (a/close! out-chan)
+            (a/close! cancel-chan)))
+        chans))))
+
+(defn async-transducing-qp [results-xform rf]
+  (query-processor
+   results-xform
+   (fn [query xform _]
+     (transduce xform rf (reducible-results :postgres query)))))
+
+(defn default-rf
+  ([] {:data {:rows []}})
+
+  ([results] results)
+
+  ([results results-meta]
+   (update results :data merge results-meta))
+
+  ([results _ row]
+   (update-in results [:data :rows] conj row)))
+
+(def ^:private default-async-transducing-qp
+  (async-transducing-qp identity default-rf))
+
+(defn process-query-async
+  ([query]
+   (default-async-transducing-qp query))
+
+  ([query rf]
+   ((async-transducing-qp identity rf) query))
+
+  ([query results-xform rf]
+   ((async-transducing-qp results-xform rf) query)))
+
+(defn sync-results [{:keys [out-chan]}]
+  ;; TODO - timeout?
+  (let [result (a/<!! out-chan)]
+    (println "<< QUERY FINISHED >>")
+    (when (instance? Throwable result)
+      (throw result))
+    result))
+
+(defn process-query
+  ([query]
+   (sync-results (process-query-async query)))
+
+  ([query rf]
+   (sync-results (process-query-async query rf)))
+
+  ([query results-xform rf]
+   (sync-results (process-query-async query results-xform rf))))
+
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                             Sample RFs / Test Fns                                              |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defn- print-rows-rf
   ([] 0)
@@ -133,92 +263,16 @@
      (.write writer (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
      (inc row-count))))
 
-(defn- add-a-column-xform [rf]
-  (fn
-    ([]
-     (rf))
-
-    ([result]
-     (rf result))
-
-    ([result results-meta]
-     (rf result (update results-meta :cols (fn [cols]
-                                             (conj (vec cols) {:name :extra-col})))))
-
-    ([acc results-meta row]
-     (rf acc results-meta (conj row "Neat!")))))
-
-(defn- middleware-1 [qp]
-  (fn [query results-xform chans]
-    (println "IN MIDDLEWARE 1!")
-    (qp query results-xform chans)))
-
-(defn- add-a-column-middleware [qp]
-  (fn [query results-xform chans]
-    (qp query (comp results-xform add-a-column-xform) chans)))
-
-(defn- async-middleware [qp]
-  (fn [query results-xform {:keys [cancel-chan], :as chans}]
-    (let [futur (future
-                  (println "Sleep 500.")
-                  (Thread/sleep 500)
-                  (println "Done sleeping.")
-                  (qp query results-xform chans))]
-      (a/go
-        (when (a/<! (:cancel-chan chans))
-          (future-cancel futur))))
-    nil))
-
-(defn- build-pipeline [f]
-  (-> f
-      middleware-1
-      async-middleware
-      add-a-column-middleware))
-
-(def ^{:arglists '([query results-xform chans])} pipeline
-  (build-pipeline
-   (fn [query results-xform {:keys [cancel-chan out-chan rf]}]
-     (try
-       (let [result (transduce results-xform rf (reducible-results :postgres query))]
-         (a/put! out-chan (or result :no-result)))
-       (catch Throwable e
-         (a/put! out-chan e))
-       (finally
-         (a/close! cancel-chan)
-         (a/close! out-chan))))))
-
-(defn process-query-async [query rf]
-  (println "Starting query.")
-  (let [out-chan    (a/promise-chan)
-        cancel-chan (a/promise-chan)
-        chans       {:out-chan out-chan, :cancel-chan (a/promise-chan)}
-        ;; TODO - should use a bounded threadpool for this
-        futur       (future (pipeline query identity (assoc chans :rf rf)))]
-    (a/go
-      (when (a/<! (:cancel-chan chans))
-        (println "Query canceled.")
-        (future-cancel futur)
-        (a/put! out-chan {:status :canceled})
-        (a/close! out-chan)
-        (a/close! cancel-chan)))
-    chans))
-
-(defn process-query [query rf]
-  ;; TODO - timeout?
-  (let [{:keys [out-chan]} (process-query-async query rf)
-        result             (a/<!! out-chan)]
-    (println "<< QUERY FINISHED >>")
-    (when (instance? Throwable result)
-      (throw result))
-    result))
-
 
 ;;; ------------------------------------------------------ test ------------------------------------------------------
 
-(defn- x []
+(defn- default-example []
+  (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;"))
+
+(defn- print-rows-example []
   (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" print-rows-rf))
 
-(defn- x2 []
+(defn- print-rows-to-file-example []
   (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test.txt")]
     (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" (print-rows-to-writer-rf w))))
 
@@ -228,11 +282,10 @@
   ([_ results-meta] results-meta)
   ([acc results-meta row] (conj acc (zipmap (map (comp keyword :name) (:cols results-meta))
                                             row))))
-
-(defn- y []
+(defn- maps-example []
   (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))
 
-(defn- z []
+(defn- cancel-example []
   (let [{:keys [cancel-chan out-chan]} (process-query-async "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf)]
     (a/put! cancel-chan :cancel)
     (a/<!! out-chan)))
