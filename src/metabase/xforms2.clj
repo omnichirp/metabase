@@ -72,7 +72,12 @@
   (fn execute*-qp5 [query xform respond raise cancel]
     (letfn [(respond' [result]
               (println "build-qp4 respond got result" (class result))
-              (respond (transduce xform rf (rf) result)))]
+              (respond
+               (try
+                 (println "[REDUCING]")
+                 (transduce xform rf (rf) result)
+                 (finally
+                   (println "[REDUCED]")))))]
       (try
         (sql-jdbc-xforms/execute-query query respond' raise cancel)
         (catch Throwable e
@@ -231,11 +236,18 @@
      (inc row-count))))
 
 (defn- maps-rf
-  ([] [])
-  ([acc] acc)
-  ([_ results-meta] results-meta)
-  ([acc results-meta row] (conj acc (zipmap (map (comp keyword :name) (:cols results-meta))
-                                            row))))
+  ([] {})
+
+  ([[_ results]] results)
+
+  ([results results-meta]
+   [(mapv (comp keyword :name) (:cols results-meta))
+    (merge results-meta results)])
+
+  ([[col-names results] _ row]
+   [col-names
+    (update results :rows (fn [rows]
+                            (conj rows (zipmap col-names row))))]))
 
 
 ;;; ------------------------------------------------------ test ------------------------------------------------------
@@ -260,7 +272,8 @@
       (qp "SELECT * FROM users ORDER BY id ASC LIMIT 5;"))))
 
 (defn- maps-example []
-  (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))
+  (let [qp (sync-qp1 (build-qp4 maps-rf default-middleware) 5000)]
+    (qp "SELECT * FROM users ORDER BY id ASC LIMIT 5;")))
 
 (defn- cancel-example []
   (let [{:keys [cancel-chan out-chan]} (process-query-async "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf)]
