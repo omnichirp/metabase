@@ -1,4 +1,4 @@
-(ns metabase.xforms
+(ns metabase.sql-jdbc-xforms
   (:require [metabase
              [driver :as driver]
              [test :as mt]
@@ -7,7 +7,9 @@
   (:import [java.sql Connection JDBCType ResultSet ResultSetMetaData Types]
            javax.sql.DataSource))
 
-;; New QP style
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                JDBC Execute 2.0                                                |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defn- jdbc-spec []
   (sql-jdbc.conn/db->pooled-connection-spec (mt/with-driver :postgres (mt/db))))
@@ -67,75 +69,38 @@
       :db_type   (.getColumnTypeName rsmeta i)})
    (range 1 (inc (.getColumnCount rsmeta)))))
 
-(defn- consume-results
-  "Consumes rows in ResultSet `rs` using reducing fn `rf`."
-  [driver rf ^ResultSet rs]
-  (let [rsmeta   (.getMetaData rs)
-        col-meta (col-meta rsmeta)
-        read-row (read-row-fn driver rs rsmeta)
-        rf       (rf col-meta)]
-    (println "<Consuming results>")
-    (loop [result (rf)]
-      (if-not (.next rs)
-        (rf result)
-        (let [row    (read-row)
-              result (rf result row)]
-          (if (reduced? result)
-            @result
-            (recur result)))))))
+(defn- reducible-query [^String sql raise]
+  (reify
+    clojure.lang.IReduceInit
+    (reduce [_ rf init]
+      (try
+        (println "<Opening connection>")
+        (with-open [conn (doto (.getConnection (datasource))
+                           (.setAutoCommit false)
+                           (.setReadOnly true)
+                           (.setTransactionIsolation Connection/TRANSACTION_READ_UNCOMMITTED))
+                    stmt (doto (.prepareStatement conn sql
+                                                  ResultSet/TYPE_FORWARD_ONLY
+                                                  ResultSet/CONCUR_READ_ONLY
+                                                  ResultSet/CLOSE_CURSORS_AT_COMMIT)
+                           (.setFetchDirection ResultSet/FETCH_FORWARD))
+                    rs   (.executeQuery stmt)]
+          (let [rsmeta       (.getMetaData rs)
+                read-row     (read-row-fn :postgres rs rsmeta)
+                results-meta {:cols (col-meta rsmeta)}]
+            (loop [result (rf init results-meta)]
+              (if-not (.next rs)
+                result
+                (let [row    (read-row)
+                      result (rf result results-meta row)]
+                  (if (reduced? result)
+                    @result
+                    (recur result)))))))
+        (catch Throwable e
+          (raise e))
+        (finally
+          (println "<closing connection>"))))))
 
-(defn- run-query
-  [driver ^String sql rf]
-  (with-open [conn (doto (.getConnection (datasource))
-                     (.setAutoCommit false)
-                     (.setReadOnly true)
-                     (.setTransactionIsolation Connection/TRANSACTION_READ_UNCOMMITTED))
-              stmt (doto (.prepareStatement conn sql
-                                            ResultSet/TYPE_FORWARD_ONLY
-                                            ResultSet/CONCUR_READ_ONLY
-                                            ResultSet/CLOSE_CURSORS_AT_COMMIT)
-                     (.setFetchDirection ResultSet/FETCH_FORWARD))
-              rs   (.executeQuery stmt)]
-    (consume-results driver rf rs)))
-
-(defn- print-rows-rf [col-meta]
-  (println "COLS ->" (pr-str (map :name col-meta)))
-  (fn
-    ([] 0)
-
-    ([row-count] {:rows row-count})
-
-    ([row-count row]
-     (println (format "ROW %d ->" (inc row-count)) (pr-str row))
-     (inc row-count))))
-
-(defn- rows->maps-rf [col-meta]
-  (let [col-names (map (comp keyword :name) col-meta)]
-    (fn
-      ([] [])
-      ([acc] acc)
-      ([acc row]
-       (conj acc (zipmap col-names row))))))
-
-(defn- print-rows-to-writer-rf [^java.io.Writer writer, col-meta]
-  (.write writer (str "COLS -> " (pr-str (map :name col-meta)) "\n"))
-  (fn
-    ([] 0)
-
-    ([row-count] {:rows row-count})
-
-    ([row-count row]
-     (.write writer (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
-     (inc row-count))))
-
-(defn- x []
-  (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test.txt")]
-    (let [result (run-query :postgres "SELECT * FROM users ORDER BY id ASC LIMIT 5;" (partial print-rows-to-writer-rf w))]
-      (println "Done." result))))
-
-
-
-
-#_(defn- middleware [qp]
-    (fn [query respond rows-xform raise canceled-chan]
-      (qp query respond rows-xform raise canceled-chan)))
+(defn execute-query
+  [query respond raise _]
+  (respond (reducible-query query raise)))
