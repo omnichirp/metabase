@@ -33,6 +33,7 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defn- execute* [query xform respond raise cancel-chan]
+  (println "execute* raise:" raise)
   (sql-jdbc-xforms/execute-query query (partial respond xform) raise cancel-chan))
 
 (defn- build-qp5 [middleware]
@@ -43,11 +44,15 @@
             middleware)]
     (fn qp5* [query rf respond raise cancel-chan]
       (letfn [(respond* [xform result]
-                (try
-                  (locking println (println "[REDUCING]"))
-                  (respond (transduce xform rf (rf) result))
-                  (finally
-                    (locking println (println "[REDUCED]")))))]
+                (if-not (instance? clojure.lang.IReduceInit result)
+                  (respond result)
+                  (try
+                    (locking println (println "[REDUCING]"))
+                    (respond (transduce xform rf (rf) result))
+                    (locking println (println "[REDUCED]"))
+                    nil
+                    (catch Throwable e
+                      (raise e)))))]
         (try
           (qp query identity respond* raise cancel-chan)
           (catch Throwable e
@@ -176,47 +181,6 @@
   (u/profile "Build qp5"
     (build-qp5 default-middleware)))
 
-;; ;; TODO - or should this be some sort of middleware? For async situations
-;; (defn userland-exception-middleware [qp]
-;;   (fn [query xform {:keys [out-chan], :as chans}]
-;;     (letfn [(exception-response [^Throwable e]
-;;               (merge
-;;                {:message    (.getMessage e)
-;;                 :stacktrace (u/filtered-stacktrace e)}
-;;                (when-let [cause (.getCause e)]
-;;                  {:cause (exception-response cause)})))]
-;;       (let [new-out-chan (a/promise-chan)]
-;;         ;; close `new-out-chan` if `out-chan` gets closed
-;;         (a/go
-;;           (a/<! out-chan)
-;;           (a/close! new-out-chan))
-;;         (a/go
-;;           (when-let [result (a/<! new-out-chan)]
-;;             (locking println(println "result:" result)  ; NOCOMMIT
-;;             (if (instance? Throwable result)
-;;               (a/>! out-chan (exception-response result))
-;;               (a/>! out-chan result))
-;;             (a/close! new-out-chan)
-;;             (a/close! out-chan)))
-;;         (qp query xform (assoc chans :out-chan new-out-chan))))))
-
-;; #_(defn process-userland-query [query]
-;;   (letfn [(exception-response [^Throwable e]
-;;             (merge
-;;              {:message    (.getMessage e)
-;;               :stacktrace (u/filtered-stacktrace e)}
-;;              (when-let [cause (.getCause e)]
-;;                {:cause (exception-response cause)})))]
-;;     (try
-;;       (process-query query)
-;;       (catch Throwable e
-;;         (assoc (exception-response e)
-;;                :status :failed)))))
-
-;; (defn process-userland-query [query]
-;;   (process-query query identity default-rf (cons userland-exception-middleware default-middleware)))
-
-
 ;; ;;; +----------------------------------------------------------------------------------------------------------------+
 ;; ;;; |                                             Sample RFs / Test Fns                                              |
 ;; ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -303,5 +267,42 @@
 (defn- exception-example []
   (process-query "SELECT asdasdasd;"))
 
-#_(defn- userland-exception-example []
-  (process-userland-query "SELECT asdasdasd;"))
+;;; ------------------------------------------------ Userland Example ------------------------------------------------
+
+(defn add-ex-info-middleware [qp]
+  (fn [query xform respond raise canceled-chan]
+    (letfn [(raise' [e]
+              (raise (ex-info "WHoopS!" {:extra-info? true} e)))]
+      (qp query xform respond raise' canceled-chan))))
+
+;; TODO - or should this be some sort of middleware? For async situations
+(defn userland-exception-middleware [qp]
+  (fn [query xform respond _ canceled-chan]
+    (println "respond:" respond)        ; NOCOMMIT
+    (letfn [(exception-response [^Throwable e]
+              (merge
+               {:message    (.getMessage e)
+                :stacktrace (u/filtered-stacktrace e)}
+               (when-let [data (ex-data e)]
+                 {:data data})
+               (when (instance? java.sql.SQLException e)
+                 {:state (.getSQLState ^java.sql.SQLException e)})
+               (when-let [cause (or (when (instance? java.sql.SQLException e)
+                                      (.getNextException ^java.sql.SQLException e))
+                                    (.getCause e))]
+                 {:cause (exception-response cause)})))
+            (raise [e]
+              (respond nil (exception-response e)))]
+      (qp query xform respond raise canceled-chan))))
+
+(def ^{:arglists '([query] [query rf])} process-userland-query
+  (let [qp (sync-qp2 (build-qp5 (concat [add-ex-info-middleware] default-middleware [userland-exception-middleware]))
+                     5000)]
+    (fn
+      ([query]
+       (qp query default-rf))
+      ([query rf]
+       (qp query rf)))))
+
+(defn userland-query-example []
+  (process-userland-query "SELECT asdadasds;"))

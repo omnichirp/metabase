@@ -74,7 +74,7 @@
     clojure.lang.IReduceInit
     (reduce [_ rf init]
       (try
-        (println "<Opening connection>")
+        (locking println (println "<Opening connection>"))
         (with-open [conn (doto (.getConnection (datasource))
                            (.setAutoCommit false)
                            (.setReadOnly true)
@@ -90,7 +90,9 @@
                 results-meta {:cols (col-meta rsmeta)}]
             (loop [result (rf init results-meta)]
               (if-not (.next rs)
-                result
+                (do
+                  (locking println (println "<All rows consumed.>"))
+                  result)
                 (let [row    (read-row)
                       result (rf result results-meta row)]
                   (if (reduced? result)
@@ -99,7 +101,7 @@
         (catch Throwable e
           (raise e))
         (finally
-          (println "<closing connection>"))))))
+          (locking println (println "<closing connection>")))))))
 
 (defn execute-query
   [query respond raise _]
