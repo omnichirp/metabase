@@ -6,14 +6,116 @@
 
 (set! *warn-on-reflection* true)
 
+;; Signatures:
+;;
+;; (Driver) execute-query:
+;;
+;; (execute-query query respond raise cancel-chan) -> reducible result
+;;
+;; Middleware:
+;;
+;; (middleware qp) -> (fn [query xform respond raise cancel-chan])
+;;
+;; qp5:
+;;
+;; (qp5 query rf respond raise cancel-chan) -> ?
+;;
+;; qp2
+;;
+;; (qp query rf) -> ?
+;;
+;; qp1
+;;
+;; (qp1 query) -> ?
+
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                              Sample Middleware/QP                                              |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+(defn- execute* [query xform respond raise cancel-chan]
+  (sql-jdbc-xforms/execute-query query (partial respond xform) raise cancel-chan))
+
+(defn- build-qp5 [middleware]
+  (let [qp (reduce
+            (fn [qp middleware]
+              (middleware qp))
+            execute*
+            middleware)]
+    (fn qp5* [query rf respond raise cancel-chan]
+      (letfn [(respond* [xform result]
+                (try
+                  (locking println (println "[REDUCING]"))
+                  (respond (transduce xform rf (rf) result))
+                  (finally
+                    (locking println (println "[REDUCED]")))))]
+        (try
+          (qp query identity respond* raise cancel-chan)
+          (catch Throwable e
+            (raise e)))))))
+
+(defn- async-qp2 [qp5 timeout-ms]
+  (fn [query rf]
+    (let [result-chan (a/promise-chan)
+          cancel-chan (a/promise-chan)]
+      ;; wait for results, then pass to result-chan
+      (a/go
+        (let [[val port] (a/alts!! [result-chan (a/timeout timeout-ms)])]
+          (locking println (println "async-qp2 got result" val "from port" (if (= port result-chan) "result-chan" "timeout chan")))
+          (when-not (= port result-chan)
+            (a/put! cancel-chan :cancel)
+            (a/put! result-chan {:status  :timed-out
+                                 :message (format "Timed out after %s." (u/format-milliseconds timeout-ms))})
+            (a/close! cancel-chan)
+            (a/close! result-chan))))
+      ;; listen for cancelation and reply with {:status :canceled}
+      (a/go
+        (when (a/<! cancel-chan)
+          (locking println (println "async-qp2 got cancel message (canceling query)"))
+          (a/put! result-chan {:status :canceled})
+          (a/close! result-chan)
+          (a/close! cancel-chan)))
+      (letfn [(async-qp2-respond [result]
+                (locking println (println "async-qp2-respond got result" result))
+                (a/put! result-chan result)
+                (a/close! result-chan)
+                (a/close! cancel-chan))
+              (async-qp2-raise [e]
+                (locking println (println "async-qp2-raise got exception" (class e)))
+                (a/put! result-chan e)
+                (a/close! result-chan)
+                (a/close! cancel-chan))]
+        (qp5 query rf async-qp2-respond async-qp2-raise cancel-chan))
+      {:result-chan result-chan
+       :cancel-chan cancel-chan})))
+
+(defn- sync-qp2 [qp5 timeout-ms]
+  (let [qp2 (async-qp2 qp5 timeout-ms)]
+    (fn [query rf]
+      (let [{:keys [result-chan]} (qp2 query rf)
+            result                (a/<!! result-chan)]
+        (if (instance? Throwable result)
+          (throw result)
+          result)))))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                               Default/Test Impls                                               |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn default-rf
+  ([] {:data {:rows []}})
+
+  ([results] results)
+
+  ([results results-meta]
+   (update results :data merge results-meta))
+
+  ([results _ row]
+   (update-in results [:data :rows] conj row)))
+
 (defn- middleware-1 [qp]
-  (fn [query xform respond raise cancel]
-    (println "IN MIDDLEWARE 1!")
-    (qp query xform respond raise cancel)))
+  (fn [query xform respond raise cancel-chan]
+    (locking println (println "IN MIDDLEWARE 1!"))
+    (qp query xform respond raise cancel-chan)))
 
 (defn- add-a-column-xform [rf]
   (fn
@@ -30,138 +132,49 @@
 (defn- add-a-column-middleware
   "Adds an extra column to the results."
   [qp]
-  (fn [query xform respond raise cancel]
+  (fn [query xform respond raise cancel-chan]
     (let [xform' (comp xform add-a-column-xform)]
-      (qp query xform' respond raise cancel))))
+      (qp query xform' respond raise cancel-chan))))
 
 (defn- async-middleware
   "Adds some async sleeping."
   [qp]
-  (fn [query xform respond raise cancel]
-    (let [futur   (atom nil)
-          cancel' (fn []
-                    (some-> @futur future-cancel)
-                    (cancel))]
-      (reset! futur (future
-                      (println "Sleep 50.")
-                      (Thread/sleep 50)
-                      (println "Done sleeping.")
-                      (try
-                        (qp query xform respond raise cancel')
-                        (catch Throwable e
-                          (raise e)))))
+  (fn [query xform respond raise cancel-chan]
+    (let [futur (future
+                  (try
+                    (locking println (println "Sleep 50."))
+                    (Thread/sleep 50)
+                    (locking println (println "Done sleeping."))
+                    (qp query xform respond raise cancel-chan)
+                    (catch Throwable e
+                      (raise e))))]
+      (a/go
+        (when (a/<! cancel-chan)
+          (locking println (println "In async-middleware, canceling sleep."))
+          (future-cancel futur)))
       nil)))
 
 (defn- async-cancel-middleware
-  "Runs query on a separate thread and cancels it, returning `:canceled` response when query is canceled."
+  "Runs query on a separate thread and cancel-chans it, returning `:cancel-chaned` response when query is cancel-chaned."
   [qp]
-  (fn [query xform respond raise cancel]
-    (let [futur   (atom nil)
-          cancel' (fn []
-                    (some-> @futur future-cancel)
-                    (respond {:status :canceled})
-                    (cancel))]
-      (reset! futur (future
-                      (try
-                        (qp query xform respond raise cancel')
-                        (catch Throwable e
-                          (raise e)))))
-      nil)))
-
-(defn- execute* [rf]
-  (fn execute*-qp5 [query xform respond raise cancel]
-    (letfn [(respond' [result]
-              (println "build-qp4 respond got result" (class result))
-              (respond
-               (try
-                 (println "[REDUCING]")
-                 (transduce xform rf (rf) result)
-                 (finally
-                   (println "[REDUCED]")))))]
-      (try
-        (sql-jdbc-xforms/execute-query query respond' raise cancel)
-        (catch Throwable e
-          (raise e))))))
-
-(defn- build-qp4
-  "Returns a QP fn with the signature `(qp-fn query respond raise cancel)`."
-  [rf middleware]
-  (u/profile "build query processor"
-    (let [qp (reduce
-              (fn [qp middleware]
-                (middleware qp))
-              (execute* rf)
-              middleware)]
-      (fn qp4* [query respond raise cancel]
-        (try
-          (qp query identity respond raise cancel)
-          (catch Throwable e
-            (raise e)))))))
-
-(defn- async-qp1 [qp4 timeout-ms]
-  (fn [query]
-    (let [result-chan (a/promise-chan)
-          cancel-chan (a/promise-chan)
-          cancel      (constantly nil)]
+  (fn [query xform respond raise cancel-chan]
+    (let [futur (future
+                  (try
+                    (qp query xform respond raise cancel-chan)
+                    (catch Throwable e
+                      (raise e))))]
       (a/go
         (when (a/<! cancel-chan)
-          (println "async-qp1 got cancel message (canceling query)")
-          (cancel)
-          (a/put! result-chan {:status :canceled})
-          (a/close! result-chan)
-          (a/close! cancel-chan)))
-      (a/go
-        (let [[val port] (a/alts!! [result-chan (a/timeout timeout-ms)])]
-          (println "async-qp1 got result" (class val) "from port" (if (= port result-chan) "result-chan" "timeout chan"))
-          (when-not (= port result-chan)
-            (a/put! cancel-chan :cancel)
-            (a/put! result-chan {:status  :timed-out
-                                 :message (format "Timed out after %s." (u/format-milliseconds timeout-ms))})
-            (a/close! cancel-chan)
-            (a/close! result-chan))))
-      (qp4
-       query
-       (fn async-qp1-respond [result]
-         (println "async-qp1-respond got result" (class result))
-         (a/put! result-chan result)
-         (a/close! result-chan)
-         (a/close! cancel-chan))
-       (fn async-qp1-raise [e]
-         (println "async-qp1-raise got exception" (class e))
-         (a/put! result-chan e)
-         (a/close! result-chan)
-         (a/close! cancel-chan))
-       cancel)
-      {:result-chan result-chan
-       :cancel-chan cancel-chan})))
-
-(defn- sync-qp1 [qp4 timeout-ms]
-  (let [qp1 (async-qp1 qp4 timeout-ms)]
-    (fn [query]
-      (let [{:keys [result-chan]} (qp1 query)
-            result                (a/<!! result-chan)]
-        (if (instance? Throwable result)
-          (throw result)
-          result)))))
-
-;;; ------------------------------------------------- Default Impls --------------------------------------------------
-
-(defn default-rf
-  ([] {:data {:rows []}})
-
-  ([results] results)
-
-  ([results results-meta]
-   (update results :data merge results-meta))
-
-  ([results _ row]
-   (update-in results [:data :rows] conj row)))
+          (locking println (println "In async-cancel-middleware, canceling query."))
+          (future-cancel futur)))
+      nil)))
 
 (def default-middleware
   [add-a-column-middleware async-middleware middleware-1 async-cancel-middleware])
 
-(def ^{:arglists '([query respond raise cancel])} default-qp4
-  (build-qp4 default-rf default-middleware))
+(def ^{:arglists '([query rf respond raise cancel-chan])} default-qp5
+  (u/profile "Build qp5"
+    (build-qp5 default-middleware)))
 
 ;; ;; TODO - or should this be some sort of middleware? For async situations
 ;; (defn userland-exception-middleware [qp]
@@ -179,7 +192,7 @@
 ;;           (a/close! new-out-chan))
 ;;         (a/go
 ;;           (when-let [result (a/<! new-out-chan)]
-;;             (println "result:" result)  ; NOCOMMIT
+;;             (locking println(println "result:" result)  ; NOCOMMIT
 ;;             (if (instance? Throwable result)
 ;;               (a/>! out-chan (exception-response result))
 ;;               (a/>! out-chan result))
@@ -214,11 +227,11 @@
   ([row-count] row-count)
 
   ([row-count results-meta]
-   (println "results meta ->\n" (u/pprint-to-str 'blue results-meta))
+   (locking println (println "results meta ->\n" (u/pprint-to-str 'blue results-meta)))
    row-count)
 
   ([row-count _ row]
-   (println (u/format-color 'yellow "ROW %d ->" (inc row-count)) (pr-str row))
+   (locking println (println (u/format-color 'yellow "ROW %d ->" (inc row-count)) (pr-str row)))
    (inc row-count)))
 
 (defn- print-rows-to-writer-rf [^java.io.Writer writer]
@@ -252,33 +265,40 @@
 
 ;;; ------------------------------------------------------ test ------------------------------------------------------
 
-(def ^{:arglists '([query])} process-query-async
-  (async-qp1 default-qp4 5000))
+(def ^{:arglists '([query] [query rf])} process-query-async
+  (let [qp (async-qp2 default-qp5 5000)]
+    (fn
+      ([query]
+       (qp query default-rf))
+      ([query rf]
+       (qp query rf)))))
 
-(def ^{:arglists '([query])} process-query
-  (sync-qp1 default-qp4 5000))
+(def ^{:arglists '([query] [query rf])} process-query
+  (let [qp (sync-qp2 default-qp5 5000)]
+    (fn
+      ([query]
+       (qp query default-rf))
+      ([query rf]
+       (qp query rf)))))
 
 (defn- default-example []
   (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;"))
 
 (defn- print-rows-example []
-  (let [qp (sync-qp1 (build-qp4 print-rows-rf default-middleware) 5000)]
-    (qp "SELECT * FROM users ORDER BY id ASC LIMIT 5;")))
+  (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" print-rows-rf))
 
 (defn- print-rows-to-file-example []
-  (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test.txt")]
-    (let [rf (print-rows-to-writer-rf w)
-          qp (sync-qp1 (build-qp4 rf default-middleware) 5000)]
-      (qp "SELECT * FROM users ORDER BY id ASC LIMIT 5;"))))
+  (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test2.txt")]
+    (let [rf (print-rows-to-writer-rf w)]
+      (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" rf))))
 
 (defn- maps-example []
-  (let [qp (sync-qp1 (build-qp4 maps-rf default-middleware) 5000)]
-    (qp "SELECT * FROM users ORDER BY id ASC LIMIT 5;")))
+  (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))
 
-(defn- cancel-example []
-  (let [{:keys [cancel-chan out-chan]} (process-query-async "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf)]
-    (a/put! cancel-chan :cancel)
-    (a/<!! out-chan)))
+(defn- cancel-chan-example []
+  (let [{:keys [cancel-chan-chan result-chan]} (process-query-async "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf)]
+    (a/put! cancel-chan-chan :cancel-chan)
+    (a/<!! result-chan)))
 
 (defn- exception-example []
   (process-query "SELECT asdasdasd;"))
