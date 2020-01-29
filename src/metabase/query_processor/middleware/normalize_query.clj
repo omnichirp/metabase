@@ -16,5 +16,5 @@
                          {:type  error-type/invalid-query
                           :query query}
                          e)))))]
-    (fn [query respond raise canceled-chan]
-      (qp (normalize query) respond raise canceled-chan))))
+    (fn [query xform respond raise canceled-chan]
+      (qp (normalize query) xform respond raise canceled-chan))))

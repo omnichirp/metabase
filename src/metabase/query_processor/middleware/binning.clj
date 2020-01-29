@@ -221,4 +221,8 @@
   the binned field. This middleware looks for that criteria, then updates the related min/max values and calculates
   the bin-width based on the criteria values (or global min/max information)."
   [qp]
-  (comp qp update-binning-strategy*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (update-binning-strategy* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

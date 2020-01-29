@@ -239,4 +239,8 @@
   "Middleware that assocs the `:source-query` for this query if it was specified using the shorthand `:source-table`
   `card__n` format."
   [qp]
-  (comp qp resolve-card-id-source-tables*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (resolve-card-id-source-tables* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

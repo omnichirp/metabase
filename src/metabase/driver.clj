@@ -315,7 +315,7 @@
   :hierarchy #'hierarchy)
 
 
-(defmulti execute-query
+(defmulti ^:deprecated execute-query
   "Execute a *native* query against the database and return the results.
 
   The query passed in will conform to the schema in `metabase.mbql.schema/Query`. MBQL queries are transformed to
@@ -326,8 +326,60 @@
 
     {:columns [\"id\", \"name\"]
      :rows    [[1 \"Lucky Bird\"]
-               [2 \"Rasta Can\"]]}"
+               [2 \"Rasta Can\"]]}
+
+  DEPRECATED: This is phased out in favor of `execute-query-reducible`."
   {:arglists '([driver query]), :style/indent 1}
+  dispatch-on-initialized-driver
+  :hierarchy #'hierarchy)
+
+
+(defmulti execute-query-reducible
+  "Execute a native query against that database and return results that can be reduced using `transduce` or
+  `reduce` (i.e., an object that implements `clojure.lang.IReduceInit`). `respond` should be called with this object.
+
+  You should obtain the initial value by calling `(init-fn)` immediately before beginning reduction. `init-fn` may
+  return a resource that should be closed upon completion, such as a handle to a file; in this case, it may implement
+  `java.lang.AutoCloseable`. If the init vale implements this interface, you should use it in combination with
+  `with-open`; you may use `maybe-with-open` to handle the check and usage of `with-open` automatically.
+
+    (maybe-with-open [init (init-fn)]
+      ...)
+
+  After obtaining the initial value, you should call the reducing function:
+
+  *  Once with the initial value and map containing column metadata, like
+
+         {:cols [{:name \"column_one\", :base_type :type/Integer, :database_type \"INTEGER\"}, ...]}
+
+     e.g.
+
+         ;; once
+         (rf init column-metadata)
+
+  *  Once for each row with the result of the last call, the column metadata, and the row:
+
+         ;; for each row
+         (rf result column-metadata row)
+
+  For example:
+
+    (defmethod execute-query-reducible :my-driver
+      [_ query respond _ _]
+      (respond
+       (reify clojure.lang.IReduceInit
+         (reduce [_ rf init-fn]
+           (let [column-metadata (...)
+                 rows            (...)]
+             (qp.i/maybe-with-open [init (init-fn)]
+               (loop [row rows, result (rf init column-metadata)]
+                 (if-not row
+                   result
+                   (let [result' (rf result column-metadata row)]
+                     (if (reduced? result')
+                       @result'
+                       (recur result')))))))))))"
+  {:arglists '([driver query respond raise cancel-chan])}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)
 
@@ -523,16 +575,8 @@
 (defmethod sync-in-context ::driver [_ _ f] (f))
 
 
-(defmulti process-query-in-context
-  "Similar to `sync-in-context`, but for running queries rather than syncing. This should be used to do things like
-  open DB connections that need to remain open for the duration of post-processing. This function follows a middleware
-  pattern and is injected into the QP middleware stack immediately after the Query Expander; in other words, it will
-  receive the expanded query. See the Mongo and H2 drivers for examples of how this is intended to be used.
-
-       (defmethod process-query-in-context :my-driver
-         [driver qp]
-         (fn [query]
-           (qp query)))"
+(defmulti ^:deprecated process-query-in-context
+  "DEPRECATED: This method is no longer called and will be removed in the near future."
   {:arglists '([driver qp])}
   dispatch-on-initialized-driver
   :hierarchy #'hierarchy)

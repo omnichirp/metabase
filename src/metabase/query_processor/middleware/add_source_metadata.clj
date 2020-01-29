@@ -101,15 +101,8 @@
   source queries that do not specify this information, we can often infer it by looking at the shape of the source
   query."
   [qp]
-  ;; this middleware works as both sync and async style to make our lives easier when we convert the QP to full async
-  (fn
-    ([query]
-     (qp (add-source-metadata-for-source-queries* query)))
-
-    ([query respond raise canceled-chan]
-     (when-let [query (try
-                        (add-source-metadata-for-source-queries* query)
-                        (catch Throwable e
-                          (raise e)
-                          nil))]
-       (qp query respond raise canceled-chan)))))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (add-source-metadata-for-source-queries* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

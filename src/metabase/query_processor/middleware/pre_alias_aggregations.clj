@@ -36,4 +36,8 @@
 (defn pre-alias-aggregations
   "Middleware that generates aliases for all aggregations anywhere in a query, and makes sure they're unique."
   [qp]
-  (comp qp maybe-pre-alias-aggregations))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (maybe-pre-alias-aggregations query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

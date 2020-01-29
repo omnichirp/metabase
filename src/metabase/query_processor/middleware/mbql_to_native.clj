@@ -22,20 +22,36 @@
     (when-not i/*disable-qp-logging*
       (log/trace (u/format-color 'green "Native form: %s\n%s\n" (u/emoji "😳") (u/pprint-to-str <>))))))
 
+(defn- add-native-query-xform [native-form xf]
+  (fn
+    ([]
+     (xf))
+
+    ([result]
+     (xf result))
+
+    ([result results-metadata]
+     (xf result (assoc results-metadata :native_form native-form)))
+
+    ([result results-metadata row]
+     (xf result results-metadata row))))
+
 (defn mbql->native
   "Middleware that handles conversion of MBQL queries to native (by calling driver QP methods) so the queries
    can be executed. For queries that are already native, this function is effectively a no-op."
   [qp]
-  (fn [{query-type :type, {:keys [disable-mbql->native?]} :middleware, :as query}]
+  (fn [{query-type :type, {:keys [disable-mbql->native?]} :middleware, :as query} xform respond raise canceled-chan]
     (when-not i/*disable-qp-logging*
       (log/trace (u/format-color 'yellow "\nPreprocessed:\n%s" (u/pprint-to-str query))))
     ;; disabling mbql->native is only used by the `qp/query->preprocessed` function so we can get the fully
     ;; pre-processed query *before* we convert it to native, which might fail for one reason or another
     (if disable-mbql->native?
-      (qp query)
-      (let [native-form  (query->native-form query)
-            native-query (if-not (= query-type :query)
-                           query
-                           (assoc query :native native-form))
-            results      (qp native-query)]
-        (assoc results :native_form native-form)))))
+      (qp query xform respond raise canceled-chan)
+      (try
+        (let [native-form  (query->native-form query)
+              native-query (if-not (= query-type :query)
+                             query
+                             (assoc query :native native-form))]
+          (qp native-query (comp (partial add-native-query-xform native-form) xform) respond raise canceled-chan))
+        (catch Throwable e
+          (raise e))))))

@@ -48,7 +48,7 @@
                   (respond result)
                   (try
                     (locking println (println "[REDUCING]"))
-                    (respond (transduce xform rf (rf) result))
+                    (respond (transduce xform rf rf result))
                     (locking println (println "[REDUCED]"))
                     nil
                     (catch Throwable e
@@ -205,20 +205,6 @@
    (locking println (println (u/format-color 'yellow "ROW %d ->" (inc row-count)) (pr-str row)))
    (inc row-count)))
 
-(defn- print-rows-to-writer-rf [^java.io.Writer writer]
-  (fn
-    ([] 0)
-
-    ([row-count] {:rows row-count})
-
-    ([row-count results-meta]
-     (.write writer (str "results meta -> " (pr-str results-meta) "\n"))
-     row-count)
-
-    ([row-count _ row]
-     (.write writer (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
-     (inc row-count))))
-
 (defn- maps-rf
   ([] {})
 
@@ -258,10 +244,33 @@
 (defn- print-rows-example []
   (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" print-rows-rf))
 
+(defrecord ^:private WriterReducingFnInitValue [^java.io.Writer w, row-count]
+  java.lang.AutoCloseable
+  (close [_]
+    (locking println (println "<CLOSE FILE WRITER>"))
+    (.close w)))
+
+(defn- print-rows-to-writer-rf [filename]
+  (fn
+    (^java.lang.AutoCloseable []
+     (locking println (println "<OPEN FILE WRITER>"))
+     (map->WriterReducingFnInitValue {:w         (clojure.java.io/writer filename)
+                                      :row-count 0}))
+
+    ([{:keys [row-count]}]
+     {:rows row-count})
+
+    ([{:keys [^java.io.Writer w], :as result} results-meta]
+     (.write w (str "results meta -> " (pr-str results-meta) "\n"))
+     result)
+
+    ([{:keys [^java.io.Writer w row-count], :as result} _ row]
+     (.write w (format "ROW %d -> %s\n" (inc row-count) (pr-str row)))
+     (update result :row-count inc))))
+
 (defn- print-rows-to-file-example []
-  (with-open [w (clojure.java.io/writer "/Users/cam/Desktop/test2.txt")]
-    (let [rf (print-rows-to-writer-rf w)]
-      (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" rf))))
+  (let [rf (print-rows-to-writer-rf "/Users/cam/Desktop/test2.txt")]
+    (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" rf)))
 
 (defn- maps-example []
   (process-query "SELECT * FROM users ORDER BY id ASC LIMIT 5;" maps-rf))

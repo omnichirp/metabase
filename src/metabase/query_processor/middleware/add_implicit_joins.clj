@@ -231,8 +231,6 @@
       (update query :query resolve-fk-clauses))
     query))
 
-
-
 (defn add-implicit-joins
   "Fetch and store any Tables other than the source Table referred to by `fk->` clauses in an MBQL query, and add a
   `:join-tables` key inside the MBQL inner query containing information about the `JOIN`s (or equivalent) that need to
@@ -240,4 +238,8 @@
 
   This middleware also replaces all `fk->` clauses with `joined-field` clauses, which are easier to work with."
   [qp]
-  (comp qp add-implicit-joins*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (add-implicit-joins* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

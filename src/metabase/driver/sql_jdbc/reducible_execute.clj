@@ -1,22 +1,14 @@
-(ns metabase.sql-jdbc-xforms
-  (:require [metabase
+(ns metabase.driver.sql-jdbc.reducible-execute
+  (:require [clojure.core.async :as a]
+            [metabase
              [driver :as driver]
-             [test :as mt]
              [util :as u]]
-            [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn])
+            [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+            [metabase.query-processor
+             [interface :as qp.i]
+             [store :as qp.store]])
   (:import [java.sql Connection JDBCType ResultSet ResultSetMetaData Types]
            javax.sql.DataSource))
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                                JDBC Execute 2.0                                                |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(defn- jdbc-spec []
-  (sql-jdbc.conn/db->pooled-connection-spec (mt/with-driver :postgres (mt/db))))
-
-(defn- datasource ^DataSource [] (:datasource (jdbc-spec)))
-
-(def read-column-fn nil) ; NOCOMMIT
 
 (defmulti read-column-fn
   "Should return a zero-arg function that will fetch the value of the column from the current row."
@@ -69,13 +61,14 @@
       :db_type   (.getColumnTypeName rsmeta i)})
    (range 1 (inc (.getColumnCount rsmeta)))))
 
-(defn- reducible-query [^String sql raise]
+(defn- reducible-query [driver ^DataSource datasource ^String sql params raise cancel-chan]
+  {:pre [(string? sql) (seq sql)]}
   (reify
     clojure.lang.IReduceInit
-    (reduce [_ rf init]
+    (reduce [_ rf init-fn]
       (try
         (locking println (println "<Opening connection>"))
-        (with-open [conn (doto (.getConnection (datasource))
+        (with-open [conn (doto (.getConnection datasource)
                            (.setAutoCommit false)
                            (.setReadOnly true)
                            (.setTransactionIsolation Connection/TRANSACTION_READ_UNCOMMITTED))
@@ -83,26 +76,40 @@
                                                   ResultSet/TYPE_FORWARD_ONLY
                                                   ResultSet/CONCUR_READ_ONLY
                                                   ResultSet/CLOSE_CURSORS_AT_COMMIT)
-                           (.setFetchDirection ResultSet/FETCH_FORWARD))
-                    rs   (.executeQuery stmt)]
-          (let [rsmeta       (.getMetaData rs)
-                read-row     (read-row-fn :postgres rs rsmeta)
-                results-meta {:cols (col-meta rsmeta)}]
-            (loop [result (rf init results-meta)]
-              (if-not (.next rs)
-                (do
-                  (locking println (println "<All rows consumed.>"))
-                  result)
-                (let [row    (read-row)
-                      result (rf result results-meta row)]
-                  (if (reduced? result)
-                    @result
-                    (recur result)))))))
+                           (.setFetchDirection ResultSet/FETCH_FORWARD))]
+          (dorun
+           (map-indexed
+            (fn [i param]
+              (println "Set param" (inc i) "->" (pr-str param)) ; NOCOMMIT
+              (metabase.driver.sql-jdbc.execute/set-parameter driver stmt (inc i) param))
+            params))
+          (with-open [rs (.executeQuery stmt)]
+            ;; if cancel-chan gets a message, cancel the PreparedStatement
+            (a/go
+              (when (a/<! cancel-chan)
+                (locking println (println "Query canceled, calling PreparedStatement.cancel()"))
+                (.cancel stmt)))
+            (let [rsmeta       (.getMetaData rs)
+                  read-row     (read-row-fn driver rs rsmeta)
+                  results-meta {:cols (col-meta rsmeta)}]
+              (qp.i/maybe-with-open [init (init-fn)]
+                (loop [result (rf init results-meta)]
+                  (if-not (.next rs)
+                    (do
+                      (locking println (println "<All rows consumed.>"))
+                      result)
+                    (let [row    (read-row)
+                          result (rf result results-meta row)]
+                      (if (reduced? result)
+                        @result
+                        (recur result)))))))))
         (catch Throwable e
           (raise e))
         (finally
           (locking println (println "<closing connection>")))))))
 
-(defn execute-query
-  [query respond raise _]
-  (respond (reducible-query query raise)))
+(defn execute-query-reducible
+  "Default implementation of `driver/execute-query-reducible` for `:sql-jdbc` drivers."
+  [driver {{:keys [query params]} :native} respond raise cancel-chan]
+  (let [{:keys [datasource]} (sql-jdbc.conn/db->pooled-connection-spec (qp.store/database))]
+    (respond (reducible-query driver datasource query params raise cancel-chan))))

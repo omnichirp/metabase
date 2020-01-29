@@ -1,20 +1,25 @@
 (ns metabase.query-processor.middleware.splice-params-in-response
   (:require [metabase.driver :as driver]))
 
-(defn- splice-params-in-response* [{:keys [status], {{:keys [params]} :native_form} :data, :as results}]
+(defn- splice-params-xform [driver xf]
   ;; no need to i18n this since this message is something only developers who break the QP by changing middleware
   ;; order will see
-  (assert driver/*driver*
+  (assert driver
     "Middleware order error: splice-params-in-response must run *after* driver is resolved.")
-  (cond
-    (not= status :completed)
-    results
+  (fn
+    ([]
+     (xf))
 
-    (empty? params)
-    results
+    ([result]
+     (xf result))
 
-    :else
-    (update-in results [:data :native_form] (partial driver/splice-parameters-into-native-query driver/*driver*))))
+    ([result {{:keys [params]} :native_form, :as results-metadata}]
+     (xf result (if (empty? params)
+                  results-metadata
+                  (update results-metadata :native_form (partial driver/splice-parameters-into-native-query driver)))))
+
+    ([result results-metadata row]
+     (xf result results-metadata row))))
 
 (defn splice-params-in-response
   "Middleware that manipulates query response. Splice prepared statement (or equivalent) parameters directly into the
@@ -38,4 +43,8 @@
 
   This middleware "
   [qp]
-  (comp splice-params-in-response* qp))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp query (comp (partial splice-params-xform driver/*driver*) xform) respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

@@ -100,12 +100,12 @@
   ;; that will format the Exceptions and pipe them thru as normal QP 'failure' responses. For InterruptedExceptions
   ;; however (caused when the query is canceled) pipe all the way thru to the top-level handler so it can close out
   ;; the output channel instead of writing a response to it, which will cause the cancelation message we're looking for
-  (fn [query respond top-level-raise canceled-chan]
+  (fn [query xform respond top-level-raise canceled-chan]
     (let [raise (fn [e]
                   (if (instance? InterruptedException e)
                     (top-level-raise e)
-                    (respond (format-exception query e))))]
+                    (respond nil (format-exception query e))))]
       (try
-        (qp query respond raise canceled-chan)
+        (qp query xform respond raise canceled-chan)
         (catch Throwable e
           (raise e))))))

@@ -121,4 +121,8 @@
   Applies to any unbucketed Field in a breakout, or fields in a filter clause being compared against `yyyy-MM-dd`
   format datetime strings."
   [qp]
-  (comp qp auto-bucket-datetimes*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (auto-bucket-datetimes* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

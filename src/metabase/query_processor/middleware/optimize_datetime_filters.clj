@@ -129,4 +129,8 @@
   This namespace expects to run *after* the `wrap-value-literals` middleware, meaning datetime literal strings like
   `\"2019-09-24\"` should already have been converted to `:absolute-datetime` clauses."
   [qp]
-  (comp qp optimize-datetime-filters*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (optimize-datetime-filters* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

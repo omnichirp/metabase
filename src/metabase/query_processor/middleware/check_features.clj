@@ -36,4 +36,8 @@
 (defn check-features
   "Middleware that checks that drivers support the `:features` required to use certain clauses, like `:stddev`."
   [qp]
-  (comp qp check-features*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (check-features* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

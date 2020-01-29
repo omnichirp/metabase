@@ -154,4 +154,8 @@
   "Middleware that looks for `:metric` and `:segment` macros in an unexpanded MBQL query and substitute the macros for
   their contents."
   [qp]
-  (comp qp expand-macros*))
+  (fn [query xform respond raise canceled-chan]
+    (try
+      (qp (expand-macros* query) xform respond raise canceled-chan)
+      (catch Throwable e
+        (raise e)))))

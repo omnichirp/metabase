@@ -5,6 +5,7 @@
             [metabase.driver.sql-jdbc
              [connection :as sql-jdbc.conn]
              [execute :as sql-jdbc.execute]
+             [reducible-execute :as sql-jdbc.reducible-execute]
              [sync :as sql-jdbc.sync]]
             [metabase.driver.sql.query-processor :as sql.qp]
             [metabase.driver.sql.util.unprepare :as unprepare]
@@ -47,6 +48,10 @@
 (defmethod driver/execute-query :sql-jdbc
   [driver query]
   (sql-jdbc.execute/execute-query driver query))
+
+(defmethod driver/execute-query-reducible :sql-jdbc
+  [driver query respond raise cancel-chan]
+  (sql-jdbc.reducible-execute/execute-query-reducible driver query respond raise cancel-chan))
 
 (defmethod driver/notify-database-updated :sql-jdbc
   [_ database]
